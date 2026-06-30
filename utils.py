@@ -1,241 +1,201 @@
 import os
-import esm
 import torch
-import warnings
-import argparse
+import numpy as np
+import pandas as pd
+import pickle as pk
 import torch.nn as nn
-import re 
 import torch.nn.functional as F
-from utils import *
-from torch.utils.data import DataLoader,Dataset
-warnings.simplefilter('ignore')
-class PDB(Dataset):
-    def __init__(
-        self,mode='train',fold=-1,root='./data/BCE_633',self_cycle=False
-    ):
-        self.root=root
-        assert mode in ['train','val','test']
-        if mode in ['train','val']:
-            with open(f'{self.root}/train.pkl','rb') as f:
-                self.samples=pk.load(f)
+from tqdm import tqdm,trange
+from preprocess import *
+from graph_construction import calcPROgraph
+# prot_amino2id={
+#     '<pad>': 0, '</s>': 1, '<unk>': 2, 'A': 3,
+#     'L': 4, 'G': 5, 'V': 6, 'S': 7,
+#     'R': 8, 'E': 9, 'D': 10, 'T': 11,
+#     'I': 12, 'P': 13, 'K': 14, 'F': 15,
+#     'Q': 16, 'N': 17, 'Y': 18, 'M': 19,
+#     'H': 20, 'W': 21, 'C': 22, 'X': 23,
+#     'B': 24, 'O': 25, 'U': 26, 'Z': 27
+# }
+amino2id={
+    '<null_0>': 0, '<pad>': 1, '<eos>': 2, '<unk>': 3,
+    'L': 4, 'A': 5, 'G': 6, 'V': 7, 'S': 8, 'E': 9, 'R': 10, 
+    'T': 11, 'I': 12, 'D': 13, 'P': 14, 'K': 15, 'Q': 16, 
+    'N': 17, 'F': 18, 'Y': 19, 'M': 20, 'H': 21, 'W': 22, 
+    'C': 23, 'X': 24, 'B': 25, 'U': 26, 'Z': 27, 'O': 28, 
+    '.': 29, '-': 30, '<null_1>': 31, '<mask>': 32, '<cath>': 33, '<af2>': 34
+}
+class chain:
+    def __init__(self):
+        self.sequence=[]
+        self.amino=[]
+        self.coord=[]
+        self.site={}
+        self.date=''
+        self.length=0
+        self.adj=None
+        self.edge=None
+        self.feat=None
+        self.dssp=None
+        self.name=''
+        self.chain_name=''
+        self.protein_name=''
+    def add(self,amino,pos,coord):
+        self.sequence.append(DICT[amino])
+        self.amino.append(amino2id[DICT[amino]])
+        self.coord.append(coord)
+        self.site[pos]=self.length
+        self.length+=1
+    def process(self):
+        self.amino=torch.LongTensor(self.amino)
+        self.coord=torch.FloatTensor(self.coord)
+        self.label=torch.zeros_like(self.amino)
+        self.sequence=''.join(self.sequence)
+    def extract(self,model,device,path):
+        if len(self)>1024 or model is None:
+            return
+        f=lambda x:model(x.to(device).unsqueeze(0),[36])['representations'][36].squeeze(0).cpu()
+        with torch.no_grad():
+            feat=f(self.amino)
+        torch.save(feat,f'{path}/feat/{self.name}_esm2.ts')
+    def load_dssp(self,path):
+        dssp=torch.Tensor(np.load(f'{path}/dssp/{self.name}.npy'))
+        pos=np.load(f'{path}/dssp/{self.name}_pos.npy')
+        self.dssp=torch.Tensor([
+            -2.4492936e-16, -2.4492936e-16,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        ]).repeat(self.length,1)
+        self.rsa=torch.zeros(self.length)
+        for i in range(len(dssp)):
+            self.dssp[self.site[pos[i]]]=dssp[i]
+            if dssp[i][4]>0.15:
+                self.rsa[i]=1
+        self.rsa=self.rsa.bool()
+    def load_feat(self,path):
+        self.feat=torch.load(f'{path}/feat/{self.name}_esm2.ts')
+    def load_adj(self,path,self_cycle=False):
+        graph=torch.load(f'{path}/graph/{self.name}.graph')
+        self.adj=graph['adj'].to_dense()
+        self.edge=graph['edge'].to_dense()
+        if not self_cycle:
+            self.adj[range(len(self)),range(len(self))]=0
+            self.edge[range(len(self)),range(len(self))]=0
+    def get_adj(self,path,dseq=3,dr=10,dlong=5,k=10):
+        graph=calcPROgraph(self.sequence,self.coord,dseq,dr,dlong,k)
+        torch.save(graph,f'{path}/graph/{self.name}.graph')
+    def update(self,pos,amino):
+        if amino not in DICT.keys():
+            return
+        amino_id=amino2id[DICT[amino]]
+        idx=self.site.get(pos,None)
+        if idx is None:
+            for i in self.site.keys():
+                # print(i,pos)
+                if i[:len(pos)]==pos:
+                    idx=self.site.get(i)
+                    if amino_id==self.amino[idx]:
+                        self.label[idx]=1
+                        return
+        elif amino_id!=self.amino[idx]:
+            for i in self.site.keys():
+                if i[:len(pos)]==pos:
+                    idx=self.site.get(i)
+                    if amino_id==self.amino[idx]:
+                        self.label[idx]=1
+                        return
         else:
-            with open(f'{self.root}/test.pkl','rb') as f:
-                self.samples=pk.load(f)
-        self.data=[]
-        idx=np.load(f'{self.root}/cross-validation.npy')
-        cv=10
-        inter=len(idx)//cv
-        ex=len(idx)%cv
-        if mode=='train':
-            order=[]
-            for i in range(cv):
-                if i==fold:
-                    continue
-                order+=list(idx[i*inter:(i+1)*inter+ex*(i==cv-1)])
-        elif mode=='val':
-            order=list(idx[fold*inter:(fold+1)*inter+ex*(fold==cv-1)])
-        else:
-            order=list(range(len(self.samples)))
-        order.sort()
-        tbar=tqdm(order)
-        for i in tbar:
-            tbar.set_postfix(chain=f'{self.samples[i].name}')
-            self.samples[i].load_feat(self.root)
-            self.samples[i].load_dssp(self.root)
-            self.samples[i].load_adj(self.root,self_cycle)
-            self.data.append(self.samples[i])
+            self.label[idx]=1
     def __len__(self):
-        return len(self.data)
+        return self.length
     def __getitem__(self,idx):
-        seq=self.data[idx]
-        feat=torch.cat([seq.feat,seq.dssp],1)
-        return {
-            'feat':feat,
-            'label':seq.label,
-            'adj':seq.adj,
-            'edge':seq.edge,
-        }
-        
-#if __name__ == "__main__":
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--root', type=str, default='./data/BCE_633', help='dataset path')
-#     parser.add_argument('--gpu', type=int, default=0, help='gpu.')
-#     args = parser.parse_args()
-#     root = args.root
-#     device='cpu' if args.gpu==-1 else f'cuda:{args.gpu}'
-    
-#     os.system(f'cd {root} && mkdir PDB purePDB feat dssp graph')
-#     # model=None
-#     model,_=esm.pretrained.esm2_t36_3B_UR50D()
-#     model=model.to(device)
-#     model.eval()
-#     train='total.csv'
-#     initial(train,root,model,device)
-#     with open(f'{root}/total.pkl','rb') as f:
-#         dataset=pk.load(f)
-#     dates={i.name:i.date for i in dataset}
-# #     with open(f'{root}/date.pkl','rb') as f:
-# #         dates=pk.load(f)
-#     filt_data=[]
-#     for i in dataset:
-#         if len(i)<1024 and i.label.sum()>0:
-#             filt_data.append(i)
-#     month={'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
-#     trainset,valset,testset=[],[],[]
-#     D,M,Y=[],[],[]
-#     test=20210401
-#     dates_=[]
-#     for i in filt_data:
-#         d,m,y=dates[i.name]
-#         d,m,y=int(d),month[m],int(y)
-#         if y<23:
-#             y+=2000
-#         else:
-#             y+=1900
-#         date=y*10000+m*100+d
-#         if date<test:
-#             dates_.append(date)
-#             trainset.append(i)
-#         else:
-#             testset.append(i)
-#     with open(f'{root}/train.pkl','wb') as f:
-#         pk.dump(trainset,f)
-#     with open(f'{root}/test.pkl','wb') as f:
-#         pk.dump(testset,f)
-#     idx=np.array(dates_).argsort()
-#     np.save(f'{root}/cross-validation.npy',idx)
-if __name__ == "__main__":
-    import pickle as pk
-    import numpy as np
-    from tqdm import tqdm
+        return self.amino[idx],self.coord[idx],self.label[idx]
+def collate_fn(batch):
+    edges = [item['edge'] for item in batch]
+    feats = [item['feat'] for item in batch]
+    labels = torch.cat([item['label'] for item in batch],0)
+    return feats,edges,labels
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--root', type=str, default='./data/BCE_633', help='dataset path')
-    parser.add_argument('--gpu', type=int, default=0, help='gpu index, -1 for cpu')
-    parser.add_argument('--esm_size', type=str, default='650M', choices=['150M','650M','3B'],
-                        help='ESM-2 variant: 150M | 650M | 3B')
-    parser.add_argument('--cache', type=str, default='/kaggle/working/graphbepi_cache',
-                        help='TORCH_HOME model cache path')
-    args = parser.parse_args()
-
-    # 1) Cache cho ESM (để lần sau không tải lại)
-    if args.cache:
-        os.environ['TORCH_HOME'] = args.cache
-        os.makedirs(args.cache, exist_ok=True)
-        print(f"[INFO] TORCH_HOME = {os.environ['TORCH_HOME']}")
-
-    # 2) Bảo đảm thư mục tồn tại (không dùng 'cd && mkdir')
-    root = args.root
-    for d in [root, f'{root}/PDB', f'{root}/purePDB', f'{root}/feat', f'{root}/dssp', f'{root}/graph']:
-        os.makedirs(d, exist_ok=True)
-    print(f"[INFO] Prepared folders under {root}")
-
-    # 3) Chọn device an toàn
-    if args.gpu == -1 or (not torch.cuda.is_available()):
-        device = 'cpu'
-    else:
-        n = torch.cuda.device_count()
-        device = f'cuda:{args.gpu}' if 0 <= args.gpu < n else 'cpu'
-    print(f"[INFO] Device: {device}")
-
-    # 4) Tải ESM-2 (mặc định 650M cho Kaggle)
-    try:
-        if args.esm_size == '3B':
-            print("[INFO] Loading ESM-2 t36_3B_UR50D (large)")
-            model, _ = esm.pretrained.esm2_t36_3B_UR50D()
-        elif args.esm_size == '150M':
-            print("[INFO] Loading ESM-2 t30_150M_UR50D")
-            model, _ = esm.pretrained.esm2_t30_150M_UR50D()
-        else:
-            print("[INFO] Loading ESM-2 t33_650M_UR50D (recommended)")
-            model, _ = esm.pretrained.esm2_t33_650M_UR50D()
-    except Exception as e:
-        print("[ERROR] Failed to load ESM-2:", repr(e))
-        raise
-
-    model = model.to(device)
-    model.eval()
-
-    # 5) Build dataset (đọc 'total.csv' ở thư mục làm việc hiện tại)
-    csv_path = 'total.csv'
-    if not os.path.exists(csv_path):
-        print(f"[WARN] {csv_path} not found. Check your working directory.")
-    try:
-        initial(csv_path, root, model, device)  # hàm trong utils.py
-    except Exception as e:
-        print("[ERROR] initial() failed:", repr(e))
-        raise
-
-    # 6) Tách train/test theo mốc 2021-04-01
-    with open(f'{root}/total.pkl','rb') as f:
-        dataset = pk.load(f)
-    dates = {i.name: i.date for i in dataset}
-
-    filt_data = [i for i in dataset if len(i) < 1024 and getattr(i, 'label', None) is not None and i.label.sum() > 0]
-    month = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
-    trainset, testset, DATES_FOR_CV = [], [], []
-    TEST_CUTOFF = 20210401
-
-    # for it in filt_data:
-    #     d, m, y = dates[it.name]
-    #     d = int(d)
-    #     m = month[str(m).upper()]
-    #     y = int(y); y = 2000 + y if y < 23 else 1900 + y
-    #     date_int = y*10000 + m*100 + d
-
-    #     if date_int < TEST_CUTOFF:
-    #         DATES_FOR_CV.append(date_int)
-    #         trainset.append(it)
-    #     else:
-    #         testset.append(it)
-
-    
-
-    TEST_CUTOFF = 20210401  # yyyymmdd
-    dates_ = []
-    trainset, testset = [], []
-
-    for it in filt_data:
-        raw = str(dates[it.name]).strip()  # ví dụ '11-FEB-21' hoặc '2019-07-03'
-        # Chuẩn hóa phân tách
-        parts = re.split(r'[-/\s]+', raw)
-
-        try:
-            if len(parts) >= 3 and parts[1].isalpha():
-                # dạng 'DD-MON-YY' hoặc 'DD-MON-YYYY'
-                d = int(parts[0])
-                m = month[parts[1].upper()[:3]]
-                y_str = parts[2]
-                if len(y_str) == 4:
-                    y = int(y_str)
-                else:
-                    y2 = int(y_str)
-                    y = 2000 + y2 if y2 < 23 else 1900 + y2
-            elif len(parts) >= 3 and parts[0].isdigit() and len(parts[0]) == 4:
-                # dạng 'YYYY-MM-DD'
-                y = int(parts[0]); m = int(parts[1]); d = int(parts[2])
-            else:
-                print(f"[WARN] Unrecognized date '{raw}' for {it.name}; skipping")
+def extract_chain(root,pid,chain,force=False):
+    if not force and os.path.exists(f'{root}/purePDB/{pid}_{chain}.pdb'):
+        return True
+    if not os.path.exists(f'{root}/PDB/{pid}.pdb'):
+        retry=5
+        pdb=None
+        while retry>0:
+            try:
+                with rq.get(f'https://files.rcsb.org/download/{pid}.pdb') as f:
+                    if f.status_code==200:
+                        pdb=f.content
+                        break
+            except:
+                retry-=1
                 continue
-
-            date = y*10000 + m*100 + d
-        except Exception as e:
-            print(f"[WARN] Bad date '{raw}' for {it.name}: {e}; skipping")
-            continue
-
-        if date < TEST_CUTOFF:
-            dates_.append(date)
-            trainset.append(it)
-        else:
-            testset.append(it)
-
-
-    with open(f'{root}/train.pkl','wb') as f:
-        pk.dump(trainset, f)
-    with open(f'{root}/test.pkl','wb') as f:
-        pk.dump(testset, f)
-
-    #idx = np.array(DATES_FOR_CV).argsort()
-    idx = np.array(dates_).argsort()
-    np.save(f'{root}/cross-validation.npy', idx)
-    print(f"[INFO] Done. Train: {len(trainset)}, Test: {len(testset)}, CV idx shape: {idx.shape}")
+        if pdb is None:
+            print(f'PDB file {pid} failed to download')
+            return False
+        with open(f'{root}/PDB/{pid}.pdb','wb') as f:
+            f.write(pdb)
+    lines=[]
+    with open(f'{root}/PDB/{pid}.pdb','r') as f:
+        for line in f:
+            if line[:6]=='HEADER':
+                lines.append(line)
+            if line[:6].strip()=='TER' and line[21]==chain:
+                lines.append(line)
+                break
+            feats=judge(line,None)
+            if feats is not None and feats[1]==chain:
+                lines.append(line)
+    with open(f'{root}/purePDB/{pid}_{chain}.pdb','w') as f:
+        for i in lines:
+            f.write(i)
+    return True
+def process_chain(data,root,pid,model,device):
+    get_dssp(pid,root)
+    same={}
+    with open(f'{root}/purePDB/{pid}.pdb','r') as f:
+        for line in f:
+            if line[:6]=='HEADER':
+                date=line[50:59].strip()
+                data.date=date
+                continue
+            feats=judge(line,'CA')
+            if feats is None:
+                continue
+            amino,_,site,x,y,z=feats
+            if len(amino)>3:
+                if same.get(site) is None:
+                    same[site]=amino[0]
+                if same[site]!=amino[0]:
+                    continue
+                amino=amino[-3:]
+            data.add(amino,site,[x,y,z])
+    data.process()
+    data.get_adj(root)
+    data.extract(model,device,root)
+    return data
+def initial(file,root,model=None,device='cpu',from_native_pdb=True):
+    df=pd.read_csv(f'{root}/{file}',header=0,index_col=0)
+    prefix=df.index
+    labels=df['Epitopes (resi_resn)']
+    samples=[]
+    with tqdm(prefix) as tbar:
+        for i in tbar:
+            tbar.set_postfix(protein=i)
+            if from_native_pdb:
+                state=extract_chain(root,i[:4],i[-1])
+                if not state:
+                    continue
+            data=chain()
+            p,c=i.split('_')
+            data.protein_name=p
+            data.chain_name=c
+            data.name=f"{p}_{c}"
+            process_chain(data,root,i,model,device)
+            label=labels.loc[i].split(', ')
+            for j in label:
+                site,amino=j.split('_')
+                data.update(site,amino)
+            samples.append(data)
+    with open(f'{root}/total.pkl','wb') as f:
+        pk.dump(samples,f)
