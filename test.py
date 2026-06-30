@@ -113,7 +113,7 @@ model=GraphBepi(
 model.load_state_dict(
     torch.load(f'./model/BCE_633_GraphBepi/model_-1.ckpt',map_location='cpu')['state_dict'],
 )
-trainer = pl.Trainer(gpus=[args.gpu],logger=None)
+trainer = pl.Trainer(accelerator="gpu", devices=[0] if args.gpu!=-1 else None, logger=None)
 result = trainer.test(model,test_loader)
 pred=torch.load(f'{args.output}/result.pkl')['pred']
 IDX=[]
