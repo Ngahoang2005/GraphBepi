@@ -31,11 +31,12 @@ parser.add_argument('--epochs', type=int, default=300, help='max number of epoch
 parser.add_argument('--dataset', type=str, default='BCE_633', help='dataset name.')
 parser.add_argument('--logger', type=str, default='./log', help='logger path.')
 parser.add_argument('--tag', type=str, default='GraphBepi', help='logger name.')
+parser.add_argument('--root', type=str, default='', help='root path.')
 args = parser.parse_args()
 
 device='cpu' if args.gpu==-1 else f'cuda:{args.gpu}'
 seed_everything(args.seed)
-root=f'./data/{args.dataset}'
+root=args.root
 
 trainset=PDB(mode='train',fold=args.fold,root=root)
 valset=PDB(mode='val',fold=args.fold,root=root)
