@@ -123,10 +123,13 @@ def extract_chain(root,pid,chain,force=False):
         pdb=None
         while retry>0:
             try:
-                with rq.get(f'https://files.rcsb.org/download/{pid}.pdb') as f:
-                    if f.status_code==200:
-                        pdb=f.content
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                with rq.get(f'https://files.rcsb.org/download/{pid}.pdb', headers=headers) as f:
+                    if f.status_code == 200:
+                        pdb = f.content
                         break
+                    else:
+                        print(f" Lỗi {f.status_code} khi tải {pid}")
             except:
                 retry-=1
                 continue
