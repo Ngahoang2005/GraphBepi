@@ -80,26 +80,56 @@ if __name__ == "__main__":
         if len(i)<1024 and i.label.sum()>0:
             filt_data.append(i)
     month={'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
-    trainset,valset,testset=[],[],[]
-    D,M,Y=[],[],[]
-    test=20210401
-    dates_=[]
-    for i in filt_data:
-        d,m,y=dates[i.name]
-        d,m,y=int(d),month[m],int(y)
-        if y<23:
-            y+=2000
+    TEST_CUTOFF = 20210401  # yyyymmdd
+    DATES_FOR_CV = [] # Khởi tạo danh sách lưu ngày tháng cho Cross Validation
+    trainset, testset = [], []
+
+    for it in filt_data:
+        # Lấy ngày tháng thô từ dictionary 'dates'
+        raw = str(dates[it.name]).strip()
+        
+        # Chuẩn hóa phân tách bằng Regex (tách theo dấu -, /, hoặc khoảng trắng)
+        parts = re.split(r'[-/\s]+', raw)
+        
+        try:
+            # Trường hợp 1: Dạng 'DD-MON-YY' hoặc 'DD-MON-YYYY' (VD: 11-FEB-21)
+            if len(parts) >= 3 and parts[1].isalpha():
+                d = int(parts[0])
+                m = month[parts[1].upper()[:3]] # Lấy 3 chữ cái đầu của tháng
+                y_str = parts[2]
+                if len(y_str) == 4:
+                    y = int(y_str)
+                else:
+                    y2 = int(y_str)
+                    # Quy ước: năm < 23 hiểu là 20xx, từ 23 trở đi hiểu là 19xx
+                    y = 2000 + y2 if y2 < 23 else 1900 + y2
+                    
+            # Trường hợp 2: Dạng 'YYYY-MM-DD' (VD: 2021-04-05)
+            elif len(parts) >= 3 and parts[0].isdigit() and len(parts[0]) == 4:
+                y = int(parts[0])
+                m = int(parts[1])
+                d = int(parts[2])
+                
+            else:
+                print(f"[WARN] Unrecognized date '{raw}' for {it.name}; skipping")
+                continue
+                
+            # Tính toán ra số int dạng YYYYMMDD để so sánh
+            date_int = y * 10000 + m * 100 + d
+            
+        except Exception as e:
+            print(f"[WARN] Bad date '{raw}' for {it.name}: {e}; skipping")
+            continue
+            
+        # Chia tập train/test dựa vào mốc TEST_CUTOFF
+        if date_int < TEST_CUTOFF:
+            DATES_FOR_CV.append(date_int)
+            trainset.append(it)
         else:
-            y+=1900
-        date=y*10000+m*100+d
-        if date<test:
-            dates_.append(date)
-            trainset.append(i)
-        else:
-            testset.append(i)
+            testset.append(it)
     with open(f'{root}/train.pkl','wb') as f:
         pk.dump(trainset,f)
     with open(f'{root}/test.pkl','wb') as f:
         pk.dump(testset,f)
-    idx=np.array(dates_).argsort()
+    idx=np.array(DATES_FOR_CV).argsort()
     np.save(f'{root}/cross-validation.npy',idx)
